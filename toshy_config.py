@@ -877,6 +877,25 @@ not_win_type_rgx    = re.compile("IBM|Chromebook|Apple", re.I)
 ###  SLICE_MARK_START: user_custom_lists  ###  EDITS OUTSIDE THESE MARKS WILL BE LOST ON UPGRADE
 
 
+#  STEAM APPS  ###
+# ~~~~~~~~~~~~~~
+#  Steam apps (the Steam client, and any game in your Steam library) are
+#  detected automatically, so that Toshy's special-character keymaps (and other
+#  remaps) can be skipped while a Steam app has the focus.
+#
+#  Set 'steam_apps_autodetect' to False to turn the automatic detection off.
+steam_apps_autodetect = True
+
+#  Extra Steam apps to detect by hand. Each entry is matched against both the
+#  window title and the window class of the focused window, so you can use a
+#  game title ("Kingdom Come: Deliverance II") or a window class
+#  ("KingdomCome.exe"), it does not matter which.
+#  Only needed if a game is not detected automatically.
+steam_apps_manual_lst = [
+    # 'Some Game Name',
+    # 'SomeWindowClass.exe',
+]
+
 
 ###  SLICE_MARK_END: user_custom_lists  ###  EDITS OUTSIDE THESE MARKS WILL BE LOST ON UPGRADE
 ###################################################################################################
@@ -1059,6 +1078,7 @@ def _context_pre_check(ctx: KeyContext):
     Checks:
         - App is a remote/VM? (Disables most remapping)
         - App is a terminal?  (Enable terminal-specific remaps)
+        - App is a Steam app? (Skip the special-character remaps)
         - Keyboard type (via getKBtype())
         - Active overlay flags (avoids ~100 property-getter calls per event)
         - State of "Is Enter F2" latch
@@ -1067,6 +1087,7 @@ def _context_pre_check(ctx: KeyContext):
 
     global ctx_app_is_remote
     global ctx_app_is_terminal
+    global ctx_app_is_steam
 
     global ctx_kbd_is_apple
     global ctx_kbd_is_chromebook
@@ -1086,6 +1107,7 @@ def _context_pre_check(ctx: KeyContext):
     # Update the boolean global vars to minimize repeated (hoisted) matchProps calls
     ctx_app_is_remote           = hmp_is_remote(ctx)
     ctx_app_is_terminal         = hmp_is_terminal(ctx)
+    ctx_app_is_steam            = _is_steam_app(ctx)
 
     # Establish the keyboard type during the context pre-check
     getKBtype(ctx)
@@ -1640,6 +1662,214 @@ def toggle_and_show_numlock_state(ctx: KeyContext):
 ###################################################################################################
 ###  SLICE_MARK_START: user_custom_functions  ###  EDITS OUTSIDE THESE MARKS WILL BE LOST ON UPGRADE
 
+
+###############################################################################
+###  STEAM APP DETECTION  ###
+###                                                                          ###
+###  Builds the matchers used to tell whether the focused window belongs   ###
+###  to Steam (the Steam client itself, or any game installed in your      ###
+###  Steam library). Games are matched by their window title and by their  ###
+###  window class, using the info in your library's 'appmanifest_*.acf'   ###
+###  files, so newly installed games are detected automatically.            ###
+###############################################################################
+
+# Steam apps that are runtime/tooling, not actual games. Skipped, so that
+# their files never end up in the window matching patterns.
+steam_app_skip_rgx = re.compile(
+    r'^(steam\s*linux\s*runtime|steamlinuxruntime|proton|steamworks)',
+    re.I)
+
+# Generic Windows system executables that are never a game's window class.
+steam_generic_exe_lst = [
+    'cmd.exe', 'control.exe', 'conhost.exe', 'cscript.exe', 'dllhost.exe',
+    'explorer.exe', 'mshta.exe', 'msiexec.exe', 'notepad.exe', 'regedit.exe',
+    'rundll32.exe', 'services.exe', 'start.exe', 'taskmgr.exe', 'winver.exe',
+    'wscript.exe', 'wineboot.exe', 'winecfg.exe', 'winedbg.exe',
+    'winedevice.exe', 'steam.exe', 'steamwebhelper.exe',
+    'steamerrorreporter.exe',
+]
+
+
+def _steam_parse_acf(acf_path):
+    """Parse a Steam 'appmanifest_*.acf' file into a dict of key/value pairs."""
+    dct = {}
+    try:
+        with open(acf_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith('"'):
+                    continue
+                bits = line.split('"', 3)
+                if len(bits) < 4:
+                    continue
+                value = bits[3]
+                if value.endswith('"'):
+                    value = value[:-1]
+                dct[bits[1]] = value.replace('\\"', '"').replace('\\\\', '\\')
+    except OSError:
+        return {}
+    return dct
+
+
+def _steam_library_roots():
+    """Return the list of Steam library root folders found on this machine."""
+    home_dir = os.path.expanduser('~')
+    candidate_paths = [
+        os.path.join(home_dir, '.local', 'share', 'Steam'),
+        os.path.join(home_dir, '.var', 'app', 'com.valvesoftware.Steam',
+                     '.local', 'share', 'Steam'),
+        os.path.join(home_dir, '.steam', 'steam'),
+        os.path.join(home_dir, '.steam', 'root'),
+    ]
+    roots = []
+    seen_paths = set()
+    for base_path in candidate_paths:
+        if not os.path.isdir(os.path.join(base_path, 'steamapps')):
+            continue
+        real_path = os.path.realpath(base_path)
+        if real_path in seen_paths:
+            continue
+        seen_paths.add(real_path)
+        roots.append(base_path)
+        # Extra library folders are listed in the 'libraryfolders.vdf' file
+        lf_path = os.path.join(base_path, 'steamapps', 'libraryfolders.vdf')
+        try:
+            with open(lf_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lf_content = f.read()
+        except OSError:
+            continue
+        for path_match in re.finditer(r'"path"\s+"([^"]+)"', lf_content):
+            extra_path = path_match.group(1).strip()
+            if not extra_path:
+                continue
+            if not os.path.isdir(os.path.join(extra_path, 'steamapps')):
+                continue
+            extra_real_path = os.path.realpath(extra_path)
+            if extra_real_path in seen_paths:
+                continue
+            seen_paths.add(extra_real_path)
+            roots.append(extra_path)
+    return roots
+
+
+def _steam_installed_apps():
+    """Return a list of dicts describing the Steam apps installed locally."""
+    apps = []
+    for root_path in _steam_library_roots():
+        steamapps_path = os.path.join(root_path, 'steamapps')
+        try:
+            file_names = os.listdir(steamapps_path)
+        except OSError:
+            continue
+        acf_names = sorted([f for f in file_names
+                            if f.startswith('appmanifest_') and f.endswith('.acf')])
+        for acf_name in acf_names:
+            acf_dct = _steam_parse_acf(os.path.join(steamapps_path, acf_name))
+            appid = acf_dct.get('appid', '').strip()
+            app_name = acf_dct.get('name', '').strip()
+            installdir = acf_dct.get('installdir', '').strip()
+            if not appid or not app_name:
+                continue
+            apps.append({
+                'appid':       appid,
+                'name':        app_name,
+                'installdir':  installdir,
+                'installpath': os.path.join(steamapps_path, 'common', installdir),
+            })
+    return apps
+
+
+def _steam_app_exe_names(install_path, max_depth=4, max_hits=12, max_dirs=3000):
+    """
+    Return the names of the Windows executables found in a Steam game's
+    install folder. Proton/Wine games report the executable name as the
+    window class, so this is used to match those windows as well.
+    """
+    hits = []
+    if not install_path or not os.path.isdir(install_path):
+        return hits
+    base_depth = install_path.rstrip(os.sep).count(os.sep)
+    dirs_left = max_dirs
+    for dirpath, dirnames, filenames in os.walk(install_path):
+        depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+        dirs_left -= 1
+        if dirs_left <= 0:
+            break
+        for filename in filenames:
+            if not filename.lower().endswith('.exe'):
+                continue
+            if filename.lower() in steam_generic_exe_lst:
+                continue
+            if filename not in hits:
+                hits.append(filename)
+            if len(hits) >= max_hits:
+                return hits
+    return hits
+
+
+def _build_steam_app_patterns():
+    """
+    Build the regex pattern strings used to match Steam app windows.
+    Returns a tuple of (window_title_pattern, window_class_pattern).
+    """
+    name_pats = []
+    clas_pats = []
+
+    # The Steam client itself (window class is 'steam' or 'steamwebhelper')
+    clas_pats.append(r'^(?:com\.valvesoftware\.)?steam.*$')
+
+    # Manually added Steam apps, matched against both title and class
+    for entry in steam_apps_manual_lst:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        name_pats.append(re.escape(entry))
+        clas_pats.append(re.escape(entry))
+
+    if steam_apps_autodetect:
+        for app in _steam_installed_apps():
+            if steam_app_skip_rgx.match(app['installdir']) \
+               or steam_app_skip_rgx.match(app['name']):
+                continue
+            # The game name usually appears in the window title
+            name_pats.append(re.escape(app['name']))
+            # The install folder name is often the window class, too
+            if app['installdir']:
+                clas_pats.append(re.escape(app['installdir']))
+            # Proton/Wine games use the executable name as the window class
+            for exe_name in _steam_app_exe_names(app['installpath']):
+                clas_pats.append(re.escape(exe_name))
+
+    # De-duplicate, but keep the order stable
+    name_pats = list(dict.fromkeys(name_pats))
+    clas_pats = list(dict.fromkeys(clas_pats))
+
+    return ('|'.join(name_pats), '|'.join(clas_pats))
+
+
+steam_app_name_rgx, steam_app_clas_rgx = _build_steam_app_patterns()
+
+# Build one matcher per property, so the regexes get compiled only once
+hmp_is_steam_by_name = matchProps(name=steam_app_name_rgx) if steam_app_name_rgx else None
+hmp_is_steam_by_clas = matchProps(clas=steam_app_clas_rgx) if steam_app_clas_rgx else None
+
+# Will be updated on every key event by the '_context_pre_check()' function
+ctx_app_is_steam = False
+
+
+def _is_steam_app(ctx):
+    """Return True if the focused window belongs to Steam or a Steam game."""
+    if hmp_is_steam_by_name is not None and hmp_is_steam_by_name(ctx):
+        return True
+    if hmp_is_steam_by_clas is not None and hmp_is_steam_by_clas(ctx):
+        return True
+    return False
+
+
+debug(f"Steam app detection: {len(steam_app_name_rgx)} title pattern(s), "
+      f"{len(steam_app_clas_rgx)} class pattern(s)")
 
 
 ###  SLICE_MARK_END: user_custom_functions  ###  EDITS OUTSIDE THESE MARKS WILL BE LOST ON UPGRADE
@@ -3841,7 +4071,8 @@ keymap("OptSpecialChars - ABC", {
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     cnfg.optspec_layout == 'ABC' and
-    not (ctx_app_is_terminal or ctx_app_is_remote)
+    not (ctx_app_is_terminal or ctx_app_is_remote) and
+    not ctx_app_is_steam
 )
 
 
@@ -3992,7 +4223,8 @@ keymap("OptSpecialChars - US", {
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     cnfg.optspec_layout == 'US' and
-    not (ctx_app_is_terminal or ctx_app_is_remote)
+    not (ctx_app_is_terminal or ctx_app_is_remote) and
+    not ctx_app_is_steam
 )
 
 
@@ -4085,7 +4317,8 @@ try:
         when = lambda ctx:
             ctx_ovl_level3_left_alt and
             cnfg.screen_has_focus and
-            not (ctx_app_is_terminal or ctx_app_is_remote)
+            not (ctx_app_is_terminal or ctx_app_is_remote) and
+            not ctx_app_is_steam
     )
 except NameError:
     error('setup_level3_combos_via_left_alt not available')
